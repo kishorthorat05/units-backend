@@ -80,3 +80,54 @@ def sync_lease_transaction_to_finance(lease_transaction_id):
     logger.error(
         f"Finance sync exhausted retries for LeaseTransaction {lease_transaction_id}"
     )
+
+
+def sync_lease_to_finance(lease_id):
+    """
+    Synchronously POST to Finance's internal sync endpoint for the given
+    Lease id, retrying on failure with short backoff.
+
+    Story 2.6: mirrors sync_lease_transaction_to_finance's exact retry/
+    backoff/guard/never-raises contract -- the only difference is the
+    target endpoint (POST /internal/leases/{id}/sync). Finance decides
+    whether to post by inspecting the current lease_status/security_deposit
+    values on every sync, not by diffing what changed here.
+
+    Never raises -- on exhausted retries the failure is logged loudly with
+    the source Lease.id for manual reconciliation, but the caller (the
+    post_save signal, and transitively the original UI request) always
+    completes successfully.
+    """
+    if SKIP_SYNC_UNDER_TEST_RUNNER:
+        return
+
+    if not FINANCE_INTERNAL_TOKEN:
+        logger.error(
+            f"FINANCE_INTERNAL_TOKEN is not configured -- skipping Finance sync "
+            f"for Lease {lease_id}"
+        )
+        return
+
+    url = f"{FINANCE_SERVICE_URL}/internal/leases/{lease_id}/sync"
+    payload = {"lease_id": lease_id}
+    headers = {"X-Internal-Token": FINANCE_INTERNAL_TOKEN}
+
+    for attempt_number, delay in enumerate([0] + RETRY_DELAYS, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            if resp.ok:
+                return
+        except Exception:
+            # Never let a sync failure -- of any kind, not just requests'
+            # own exception hierarchy -- propagate out of this signal-driven
+            # call and abort the triggering Lease save (AD-5/AD-6).
+            logger.debug(
+                f"Finance sync attempt {attempt_number} failed for Lease {lease_id}",
+                exc_info=True,
+            )
+
+    logger.error(
+        f"Finance sync exhausted retries for Lease {lease_id}"
+    )

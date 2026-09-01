@@ -23,7 +23,7 @@ from unittest.mock import patch
 from utilities import constants
 from user_service.models import DocumentType
 
-from lease.models import LeaseTransaction
+from lease.models import Lease, LeaseTransaction
 from lease.tests.factories import (
     UserFactory, CompanyFactory, PropertyManagerFactory,
     TenantFactory, PropertyFactory, BlockFactory,
@@ -222,3 +222,114 @@ class FinanceSyncTestRunnerGuardTestCase(TestCase):
             created_by=self.admin,
         )
         mock_post.assert_not_called()
+
+
+@patch("lease.finance_sync.SKIP_SYNC_UNDER_TEST_RUNNER", False)
+class FinanceLeaseSyncSignalTestCase(TestCase):
+    """Post-review addition (Story 2.6, verification-gap finding): mirrors
+    FinanceSyncSignalTestCase exactly, but for the new Lease post_save
+    signal (sync_lease_on_save / sync_lease_to_finance) rather than the
+    LeaseTransaction one. Confirms the outbound call shape (URL, payload
+    key, headers, timeout) and the same retry/exhaustion/never-raises
+    contract independently for this second signal."""
+
+    def setUp(self):
+        reset_sequences()
+        self.admin = UserFactory(email="admin3@test.com")
+        self.company = CompanyFactory(created_by=self.admin)
+        self.tenant = TenantFactory(created_by=self.admin)
+        self.property = PropertyFactory(company=self.company, created_by=self.admin)
+        self.block = BlockFactory(property=self.property, created_by=self.admin)
+        self.unit = UnitFactory(block=self.block, created_by=self.admin)
+
+    @patch("lease.finance_sync.time.sleep")
+    @patch("lease.finance_sync.requests.post")
+    def test_happy_path_no_retry(self, mock_post, mock_sleep):
+        """Finance mocked to return 200 -- Lease.save() fires the signal, POST succeeds on first attempt, no retry."""
+        mock_post.return_value = requests.models.Response()
+        mock_post.return_value.status_code = 200
+
+        lease = LeaseFactory(
+            unit=self.unit,
+            tenant=self.tenant,
+            lease_status=constants.ACTIVE,
+            created_by=self.admin,
+        )
+
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
+
+        # Verify the outbound call shape -- the endpoint/payload key this
+        # signal must use, distinct from the LeaseTransaction variant.
+        _, kwargs = mock_post.call_args
+        self.assertIn(f"/internal/leases/{lease.id}/sync", mock_post.call_args[0][0])
+        self.assertEqual(kwargs["json"]["lease_id"], lease.id)
+        self.assertIn("X-Internal-Token", kwargs["headers"])
+        self.assertEqual(kwargs["timeout"], 3)
+
+    @patch("lease.finance_sync.logger")
+    @patch("lease.finance_sync.time.sleep")
+    @patch("lease.finance_sync.requests.post")
+    def test_finance_unreachable_retries_and_logs(self, mock_post, mock_sleep, mock_logger):
+        """Finance mocked to raise ConnectionError on every attempt -- retries, all fail, logs loudly, save still succeeds."""
+        mock_post.side_effect = requests.ConnectionError("boom")
+
+        lease = LeaseFactory(
+            unit=self.unit,
+            tenant=self.tenant,
+            lease_status=constants.ACTIVE,
+            created_by=self.admin,
+        )
+
+        self.assertEqual(mock_post.call_count, 4)
+        self.assertEqual(mock_sleep.call_count, 3)
+        mock_sleep.assert_any_call(0.5)
+        mock_sleep.assert_any_call(1)
+        mock_sleep.assert_any_call(2)
+
+        mock_logger.error.assert_called_once()
+        self.assertIn(str(lease.id), mock_logger.error.call_args[0][0])
+
+        # Original save still succeeded despite Finance being unreachable.
+        self.assertTrue(Lease.objects.filter(pk=lease.pk).exists())
+
+    @patch("lease.finance_sync.time.sleep")
+    @patch("lease.finance_sync.requests.post")
+    def test_status_change_fires_signal_again(self, mock_post, mock_sleep):
+        """post_save fires again on a status change via the same write path -- each .save() triggers it independently."""
+        mock_post.return_value = requests.models.Response()
+        mock_post.return_value.status_code = 200
+
+        lease = LeaseFactory(
+            unit=self.unit,
+            tenant=self.tenant,
+            lease_status="DRAFT",
+            created_by=self.admin,
+        )
+        self.assertEqual(mock_post.call_count, 1)
+
+        lease.lease_status = constants.ACTIVE
+        lease.save(update_fields=["lease_status"])
+
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("lease.finance_sync.logger")
+    @patch("lease.finance_sync.time.sleep")
+    @patch("lease.finance_sync.requests.post")
+    @patch("lease.finance_sync.FINANCE_INTERNAL_TOKEN", None)
+    def test_missing_internal_token_skips_call_and_logs(
+        self, mock_post, mock_sleep, mock_logger
+    ):
+        """FINANCE_INTERNAL_TOKEN unset -- fails fast with a clear log, never
+        attempts a request with a broken/None header value."""
+        LeaseFactory(
+            unit=self.unit,
+            tenant=self.tenant,
+            lease_status=constants.ACTIVE,
+            created_by=self.admin,
+        )
+
+        mock_post.assert_not_called()
+        mock_sleep.assert_not_called()
+        mock_logger.error.assert_called_once()
+        self.assertIn("FINANCE_INTERNAL_TOKEN", mock_logger.error.call_args[0][0])
