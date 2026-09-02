@@ -16,7 +16,7 @@ HOST = os.getenv("HOST", "http://localhost:8000")
 DEFAULT_HOST = os.getenv("DEFAULT_HOST", "http://localhost:8000")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
 PASSWORD_EXPIRY_TIME = 180
-JWT_SECRET_KEY = settings.SECRET_KEY
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 
 GOOGLE_OAUTH_TOKENINFO_URL = os.getenv("GOOGLE_OAUTH_TOKENINFO_URL")
