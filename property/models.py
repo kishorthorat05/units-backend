@@ -413,6 +413,17 @@ class UnitOwner(Base):
         blank=True,
         related_name="unit_owner_links"
     )
+    ownership_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=False,
+        default=100,
+        help_text="Story 2.7 (AD-15) prerequisite: this owner's share of the "
+        "unit, 0-100. NOT NULL with a default=100 so existing write paths "
+        "(property/views.py unit-create/unit-update) that create a "
+        "UnitOwner without an explicit split keep working unchanged -- a "
+        "single implied 100%-owner is correct for those call sites.",
+    )
 
     def __str__(self):
         return f"Owner #{self.owner_id} -> Unit #{self.unit_id}"
