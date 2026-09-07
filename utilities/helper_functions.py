@@ -16,7 +16,15 @@ from io import BytesIO
 from utilities.jwt_token import create_jwt_token
 import boto3
 from botocore.exceptions import ClientError
-from utilities.config import AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET_NAME ,DEFAULT_HOST,PASSWORD_EXPIRY_TIME
+from utilities.config import AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION, S3_BUCKET_NAME, DEFAULT_HOST, PASSWORD_EXPIRY_TIME
+
+
+def _s3_client():
+    kwargs = {"region_name": AWS_REGION}
+    if AWS_ACCESS_KEY and AWS_SECRET_KEY:
+        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY
+        kwargs["aws_secret_access_key"] = AWS_SECRET_KEY
+    return boto3.client("s3", **kwargs)
 from utilities.ses_utils import send
 import logging
 from django.core.files.base import ContentFile
@@ -195,17 +203,20 @@ def resize_image(photo_base64, target_size_kb):
     return resized_photo
 
 
-def send_ses_email(to_email, subject, body_text, body_html):
+def send_ses_email(to_email, subject, body_text, body_html, cc=None):
     try:
         send(
             recipient=to_email,
             subject=subject,
             body_html=body_html,
-            body_text=body_text
+            body_text=body_text,
+            cc=cc,
         )
         return True
     except Exception as e:
-        print(f"Error sending email via SES: {str(e)}")
+        logging.getLogger(__name__).error(
+            f"SES send failed | to='{to_email}' subject='{subject}' error={e}"
+        )
         return False
     
 
@@ -223,12 +234,7 @@ def upload_file_to_s3_base64(file_data, object_name, bucket=None):
     if not bucket:
         bucket = S3_BUCKET_NAME
     try:
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-            region_name=AWS_REGION,
-        )
+        s3_client = _s3_client()
         if isinstance(file_data, str):
             if "," in file_data:
                 file_data = file_data.split(",")[1]
@@ -258,12 +264,7 @@ def fetch_s3_file_as_base64(file_url):
     try:
         bucket_name = config.S3_BUCKET_NAME
         key = file_url.split(".amazonaws.com/")[1]
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=config.AWS_ACCESS_KEY,
-            aws_secret_access_key=config.AWS_SECRET_KEY,
-            region_name=config.AWS_REGION,
-        )
+        s3_client = _s3_client()
         response = s3_client.get_object(Bucket=bucket_name, Key=key)
         file_bytes = response["Body"].read()
         return base64.b64encode(file_bytes).decode("utf-8")
@@ -295,19 +296,14 @@ def fetch_s3_presigned_url(file_url, file_name=None, expiration=3600):
          
             content_type = "application/octet-stream"
 
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=config.AWS_ACCESS_KEY,
-            aws_secret_access_key=config.AWS_SECRET_KEY,
-            region_name=config.AWS_REGION,
-        )
+        s3_client = _s3_client()
 
         presigned_url = s3_client.generate_presigned_url(
             "get_object",
             Params={
                 "Bucket": bucket_name,
                 "Key": key,
-                "ResponseContentDisposition": "inline",  
+                "ResponseContentDisposition": "inline",
                 "ResponseContentType": content_type or "application/octet-stream"
             },
             ExpiresIn=expiration
@@ -337,12 +333,7 @@ def fetch_s3_presigned_url_for_download(file_url, file_name=None, expiration=360
         else:
             content_type = "application/octet-stream"
 
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=config.AWS_ACCESS_KEY,
-            aws_secret_access_key=config.AWS_SECRET_KEY,
-            region_name=config.AWS_REGION,
-        )
+        s3_client = _s3_client()
 
         presigned_url = s3_client.generate_presigned_url(
             "get_object",

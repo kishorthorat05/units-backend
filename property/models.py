@@ -1,14 +1,70 @@
 from django.db import models
+from django.db.models import Q
 from property_management.models import Base
 from utilities import constants
-from user_service.models import Documents
+from utilities.org_scope import get_pmc_ids_for_user
+from user_service.models import Documents, PropertyManager
+from property_management.models import City
 
+
+class PropertyQuerySet(models.QuerySet):
+    def for_user(self, user_profile):
+        pmc_ids = get_pmc_ids_for_user(user_profile)
+        if not pmc_ids:
+            return self.none()
+        return self.filter(pmc_id__in=pmc_ids)
+
+
+class UnitQuerySet(models.QuerySet):
+    def for_user(self, user_profile):
+        pmc_ids = get_pmc_ids_for_user(user_profile)
+        if not pmc_ids:
+            return self.none()
+        return self.filter(
+            Q(parent_property__pmc_id__in=pmc_ids) |
+            Q(property_block_tower__property__pmc_id__in=pmc_ids)
+        ).distinct()
+
+
+class Organization(Base):
+    code = models.CharField(max_length=255, blank=True)
+    name = models.CharField(max_length=255, unique=True)
+    address = models.TextField()
+    email = models.EmailField(blank=True, null=True)
+    contact_number = models.CharField(max_length=20, blank=True, null=True)
+    city = models.ForeignKey(
+        City,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="organization_location"
+    )
+    expiry_date = models.DateField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if not self.code:
+            self.code = f"ORG{self.pk:04d}"
+            Organization.objects.filter(pk=self.pk).update(code=self.code)
+
+    def __str__(self):
+        return self.name
 
 class PropertyManagmentCompany(Base):
-    code = models.CharField(max_length=255, blank=True)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE, 
+        related_name="companies",
+    )
+    code = models.CharField(max_length=255, blank=True) 
     name = models.CharField(max_length=255)
+    email = models.EmailField(max_length=255)
+    phone_number = models.CharField(max_length=20)
     address_line_1 = models.CharField(max_length=255)
     address_line_2 = models.CharField(max_length=255)
+    city = models.CharField(max_length=100)
+    locality = models.CharField(max_length=150)
+    postal_code = models.CharField(max_length=20)
     licence_number = models.CharField(max_length=100)
     licence_expiry_date = models.DateTimeField()
     licence_issuer = models.CharField(max_length=150)
@@ -29,7 +85,37 @@ PROPERTY_STATUS_CHOICES = [
 ]
 
 
+class PMCPMMapping(Base):
+    pmc = models.ForeignKey(
+        PropertyManagmentCompany,
+        on_delete=models.CASCADE,
+        related_name="pm_mappings"
+    )
+
+    pm = models.ForeignKey(
+        PropertyManager,
+        on_delete=models.CASCADE,
+        related_name="pmc_mappings"
+    )
+
+    class Meta:
+        unique_together = ("pmc", "pm")
+        verbose_name = "PMC - Property Manager Mapping"
+        verbose_name_plural = "PMC - Property Manager Mappings"
+
+    def __str__(self):
+        return f"{self.pm} -> {self.pmc}"
+
+class PropertyType(Base):
+    code = models.CharField(max_length=50, unique=True)
+    name = models.CharField(max_length=100)
+
+    def __str__(self):
+        return self.name
+
 class Property(Base):
+    objects = PropertyQuerySet.as_manager()
+
     code = models.CharField(max_length=255, blank=True)
     property_name = models.CharField(max_length=255)
     status = models.CharField(
@@ -39,11 +125,17 @@ class Property(Base):
     )
     no_of_blocks = models.IntegerField(choices=constants.BLOCKS_CHOICES)
     no_of_units = models.IntegerField(choices=constants.UNITS_CHOICES)
-    property_type = models.CharField(
-        max_length=20,
-        choices=constants.PROPERTY_TYPE_CHOICES,
-        default=constants.APARTMENT
+    # property_type = models.CharField(
+    #     max_length=20,
+    #     choices=constants.PROPERTY_TYPE_CHOICES,
+    #     default=constants.APARTMENT
+    # )
+    property_type = models.ManyToManyField(
+        PropertyType,
+        blank=True,
+        related_name="properties"
     )
+    platforms = models.JSONField(default=list, blank=True)
     land_area = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     land_area_unit = models.CharField(
         max_length=20,
@@ -52,7 +144,6 @@ class Property(Base):
     )
     land_dm_no = models.CharField(max_length=100, null=True, blank=True)
     plot_no = models.CharField(max_length=100, null=True, blank=True)
-    makani_no = models.CharField(max_length=100, null=True, blank=True)
     dewa_no = models.CharField(max_length=100, null=True, blank=True)
     address_line_1 = models.CharField(max_length=255)
     address_line_2 = models.CharField(max_length=255)
@@ -81,25 +172,35 @@ class Property(Base):
         return self.property_name or f"Property #{self.id}"
 
     def _get_thumbnail(self):
-        img = self.property_images.filter(image_type="EXTERIOR").first()
+        img = (
+            self.property_images.filter(image_type="EXTERIOR").first()
+            or self.property_images.first()
+        )
         if not img:
             return None
         from utilities.helper_functions import fetch_s3_presigned_url
         return fetch_s3_presigned_url(img.image_path, img.file_name)
 
     def _serialize_property(self):
+        platform_choices = dict(constants.PLATFORM_CHOICES)
         return {
             "id": self.id,
             "code": self.code,
             "property_name": self.property_name,
-            "property_type": self.property_type,
+            #"property_type": self.property_type,
+            "property_type": [{"key": pt.code, "value": pt.name}for pt in self.property_type.all()],
+            #"no_of_blocks": PropertyBlocks.objects.filter(property=self).count(),
             "no_of_blocks": self.no_of_blocks,
             "no_of_units": self.no_of_units,
+            "platforms": [
+                platform_choices.get(platform, platform.replace("_", " ").title()).lower()
+                for platform in (self.platforms or [])
+            ],
+            # "no_of_units": Unit.objects.filter(property_block_tower__property=self).count(),
             "land_area": self.land_area,
             "land_area_unit": self.land_area_unit,
             "land_dm_no": self.land_dm_no,
             "plot_no": self.plot_no,
-            "makani_no": self.makani_no,
             "dewa_no": self.dewa_no,
             "address_line_1": self.address_line_1,
             "address_line_2": self.address_line_2,
@@ -123,6 +224,7 @@ class PropertyBlocks(Base):
     no_of_floors = models.IntegerField(choices=constants.FLOOR_CHOICES)
     no_of_parking = models.IntegerField(choices=constants.PARKING_CHOICES)
     no_of_units = models.IntegerField(choices=constants.UNITS_CHOICES)
+    makani_no = models.CharField(max_length=100, null=True, blank=True)
 
     def __str__(self):
         return f"{self.block_name} - {self.property.property_name}"
@@ -158,11 +260,16 @@ class PropertyDocuments(Documents):
 
 
 class Unit(Base):
+    objects = UnitQuerySet.as_manager()
+
     code = models.CharField(max_length=255, blank=True)
+    parent_property = models.ForeignKey(Property, on_delete=models.CASCADE, related_name="units", null=True, blank=True)
     property_block_tower = models.ForeignKey(
         PropertyBlocks,
         on_delete=models.CASCADE,
-        related_name="block_towers"
+        related_name="block_towers",
+        null=True,   
+        blank=True
     )
     unit_name = models.CharField(max_length=255)
     unit_size = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -207,18 +314,25 @@ class Unit(Base):
         return fetch_s3_presigned_url(img.image_path, img.file_name)
 
     def _serialize_unit(self):
+        block = self.property_block_tower
+        prop = block.property if block else self.parent_property
         return {
             "id": self.id,
             "code": self.code,
             "unit_name": self.unit_name,
             "thumbnail": self._get_unit_thumbnail(),
-            "block_id": self.property_block_tower_id,
-            "block_name": self.property_block_tower.block_name,
-            "property_id": self.property_block_tower.property_id,
-            "property_name": self.property_block_tower.property.property_name,
-            "property_address_line_1": self.property_block_tower.property.address_line_1,
-            "property_address_line_2": self.property_block_tower.property.address_line_2,
-            "property_landmark": self.property_block_tower.property.landmark,
+            "block_id": block.id if block else None,
+            "block_name": block.block_name if block else None,
+            # "property_id": self.property_block_tower.property_id,
+            "property_id": prop.id if prop else None,
+            # "property_name": self.property_block_tower.property.property_name,
+            "property_name": prop.property_name if prop else None,
+            # "property_address_line_1": self.property_block_tower.property.address_line_1,
+            "property_address_line_1": prop.address_line_1 if prop else None,
+            # "property_address_line_2": self.property_block_tower.property.address_line_2,
+            "property_address_line_2": prop.address_line_2 if prop else None,
+            # "property_landmark": self.property_block_tower.property.landmark,
+            "property_landmark": prop.landmark if prop else None,
             "unit_size": str(self.unit_size) if self.unit_size is not None else None,
             "area": self.area,
             "dm_no": self.dm_no,
@@ -239,6 +353,7 @@ class Unit(Base):
             "cycle": self.cycle,
             "notice_period": self.notice_period,
             "commission_percent": str(self.commission_percent) if self.commission_percent is not None else None,
+            "pmc": prop.pmc.name if prop and prop.pmc else None,
             "unit_owners": [
                 {
                     "id": o.id,
@@ -303,6 +418,17 @@ class UnitOwner(Base):
         blank=True,
         related_name="unit_owner_links"
     )
+    ownership_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=False,
+        default=100,
+        help_text="Story 2.7 (AD-15) prerequisite: this owner's share of the "
+        "unit, 0-100. NOT NULL with a default=100 so existing write paths "
+        "(property/views.py unit-create/unit-update) that create a "
+        "UnitOwner without an explicit split keep working unchanged -- a "
+        "single implied 100%-owner is correct for those call sites.",
+    )
 
     def __str__(self):
         return f"Owner #{self.owner_id} -> Unit #{self.unit_id}"
@@ -338,3 +464,22 @@ class PropertyManagerDocuments(Documents):
     )
     def __str__(self):
         return f"{self.company_user} -> {self.document}"
+
+
+class PropertyManagerAssignedUnits(Base):
+    unit = models.ForeignKey(
+        Unit,
+        on_delete=models.CASCADE,
+        related_name="assigned_managers"
+    )
+    property_manager = models.ForeignKey(
+        "user_service.PropertyManager",
+        on_delete=models.CASCADE,
+        related_name="assigned_units"
+    )
+
+    class Meta:
+        unique_together = ("unit", "property_manager")
+
+    def __str__(self):
+        return f"PM #{self.property_manager_id} -> Unit #{self.unit_id}"

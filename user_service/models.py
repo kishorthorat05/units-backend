@@ -1,10 +1,34 @@
 from django.db import models
 from property_management.models import Base
 from utilities import constants
+from utilities.org_scope import get_pmc_ids_for_user
 from django.utils import timezone
 from django.contrib.auth.models import User
 from datetime import timedelta
 from utilities.config import OTP_VALID_TIME
+from django.db.models import F, Q
+
+
+class OwnerQuerySet(models.QuerySet):
+    def for_user(self, user_profile):
+        pmc_ids = get_pmc_ids_for_user(user_profile)
+        if not pmc_ids:
+            return self.none()
+        return self.filter(
+            Q(unit_owner_links__unit__parent_property__pmc_id__in=pmc_ids) |
+            Q(unit_owner_links__unit__property_block_tower__property__pmc_id__in=pmc_ids)
+        ).distinct()
+
+
+class TenantQuerySet(models.QuerySet):
+    def for_user(self, user_profile):
+        pmc_ids = get_pmc_ids_for_user(user_profile)
+        if not pmc_ids:
+            return self.none()
+        return self.filter(
+            Q(lease__unit__parent_property__pmc_id__in=pmc_ids) |
+            Q(lease__unit__property_block_tower__property__pmc_id__in=pmc_ids)
+        ).distinct()
 
 
 class UserProfile(Base):
@@ -18,11 +42,15 @@ class UserProfile(Base):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="profile")
     profile_image = models.TextField(null=True, blank=True)
     pin_code = models.CharField(max_length=20, null=True, blank=True)
+    
     address_line_1 = models.CharField(max_length=255, null=True, blank=True)
     address_line_2 = models.CharField(max_length=255, null=True, blank=True)
+    locality = models.CharField(max_length=255, null=True, blank=True)
     emirate_id = models.CharField(max_length=255, null=True, blank=True)
+    email = models.EmailField(max_length=255, null=True, blank=True)
     contact_number = models.CharField(max_length=20, null=True, blank=True)
     timezone = models.CharField(max_length=100, choices=constants.TIMEZONE_CHOICES, default=constants.TIMEZONE_CHOICES[0][0])
+    nationality = models.CharField(max_length=100, blank=True, null=True)
     passport_number = models.CharField(max_length=50, blank=True, null=True)
     passport_expiry_datetime = models.DateTimeField(blank=True, null=True)
     visa_number = models.CharField(max_length=50, blank=True, null=True)
@@ -31,16 +59,36 @@ class UserProfile(Base):
     token = models.TextField(null=True, blank=True)
     password_change_timestamp = models.DateTimeField(null=True, blank=True)
 
+    def get_user_basic_info(self):
+        return {
+            "id":             self.id,
+            "name":           self.user.get_full_name() or self.user.username,
+            "email":          self.email or self.user.email,
+            "contact_number": self.contact_number,
+            "code":           self.code,
+            "profile_image":  self.profile_image or None,
+        }
+
     def __str__(self):
         return f"{self.id}-{self.user.email}"
 
 
 class Owner(UserProfile):
-    trade_license_number = models.CharField(max_length=255, blank=True, default='')
-    licence_number = models.CharField(max_length=100, blank=True, default='')
-    licence_expiry_date = models.DateTimeField(null=True, blank=True)
-    licence_issuer = models.CharField(max_length=150, blank=True, default='')
+    pmc = models.ManyToManyField(
+        "property.PropertyManagmentCompany",
+        blank=True,
+        related_name="owners"
+    )
+    objects = OwnerQuerySet.as_manager()
 
+    trade_license_number = models.CharField(max_length=255, blank=True, default='')
+    owner_number = models.CharField(max_length=20, null=True, blank=True)
+    license_number = models.CharField(max_length=255, blank=True, default='')
+    license_expiry_date = models.DateTimeField(null=True, blank=True)
+    license_issuer = models.CharField(max_length=150, blank=True, default='')
+    fax_number = models.CharField(max_length=20, null=True, blank=True)
+    po_box_number = models.CharField(max_length=20, null=True, blank=True)
+    
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         if not self.code:
@@ -49,7 +97,7 @@ class Owner(UserProfile):
 
 
 class PropertyManager(UserProfile):
-    company = models.ForeignKey("property.PropertyManagmentCompany", on_delete=models.CASCADE, related_name="company_staff")
+    company = models.ForeignKey("property.PropertyManagmentCompany", on_delete=models.CASCADE, related_name="company_staff", null=True, blank=True)
     roles = models.ManyToManyField("Role", blank=True)
 
     def save(self, *args, **kwargs):
@@ -60,6 +108,13 @@ class PropertyManager(UserProfile):
 
 
 class Tenant(UserProfile):
+    pmc = models.ManyToManyField(
+    "property.PropertyManagmentCompany",
+    related_name="tenants",
+    blank=True,
+    )
+    objects = TenantQuerySet.as_manager()
+    is_onboarding = models.BooleanField(default=False)
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         if not self.code:
@@ -68,7 +123,7 @@ class Tenant(UserProfile):
 
 
 class Permission(Base):
-    module_name = models.CharField(max_length=100)
+    module_name = models.CharField(max_length=100, choices=constants.PERMISSION_MODULE_CHOICES)
     create = models.BooleanField(default=False)
     edit = models.BooleanField(default=False)
     delete = models.BooleanField(default=False)
@@ -84,22 +139,6 @@ class Role(Base):
     permissions = models.ManyToManyField(Permission, blank=True)
 
     def __str__(self):
-        return f"{self.property_unit_name} - {self.id}"
-
-class PropertyImages(Base):
-    property = models.ForeignKey('Property', on_delete=models.CASCADE, related_name="property_images")
-    image = models.ImageField(upload_to="property_images/", null=True, blank=True)
-    image_type = models.CharField(max_length=20, default="EXTERIOR")
-    file_name = models.CharField(max_length=255, null=True, blank=True)
-
-    def __str__(self):
-        return f"{self.property.property_name} Image"
-
-class PropertyUnitImages(Base):
-    property_unit = models.ForeignKey('PropertyUnitDetails', on_delete=models.CASCADE, related_name="unit_images")
-    image = models.ImageField(upload_to="property_unit_images/", null=True, blank=True)
-    image_type = models.CharField(max_length=20, default="INTERIOR")
-    file_name = models.CharField(max_length=255, null=True, blank=True)
         return self.name
 
 
@@ -131,7 +170,8 @@ class UserVerification(models.Model):
     )
 
     def __str__(self):
-        return f"{self.email} - {self.purpose} - OTP: {self.otp}"
+        #return f"{self.email} - {self.purpose} - OTP: {self.otp}"
+        return f"{self.user_profile.user.email} - {self.purpose} - OTP: {self.otp}"
     
     def verify_otp(self, otp):
         if int(otp) != self.otp:
@@ -150,6 +190,7 @@ class DocumentType(Base):
         (constants.PROPERTY_MANAGER, "Property Manager"),
         (constants.PROPERTY, "Property"),
         (constants.UNIT, "Unit"),
+        (constants.LEASE_CHEQUE, "Lease Cheque"),
     )
     name = models.CharField(max_length=255)
     section = models.CharField(max_length=255)
@@ -162,6 +203,58 @@ class Documents(Base):
     document_type = models.ForeignKey(DocumentType, on_delete=models.CASCADE, related_name="documents")
     file_name = models.CharField(max_length=200)
     file_path = models.CharField(max_length=500)
+    main_document = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="versions"
+    )
+    issued_date = models.DateTimeField(auto_now_add=True)
+    expiry_date = models.DateField(
+        null=True,
+        blank=True
+    )
+    is_expired = models.BooleanField(default=False)
+    doc_status = models.CharField(
+        max_length=20,
+        choices=constants.DOCUMENT_STATUS_CHOICES,
+        default=constants.ACTIVE
+    )
+    @property
+    def days_to_expiry(self):
+        if not self.expiry_date:
+            return None
+        return (
+            self.expiry_date - timezone.localdate()
+        ).days
+
+    def get_document_status(self):
+        today = timezone.localdate()
+
+        if not self.expiry_date:
+            return constants.ACTIVE, "Active"
+
+        days = (self.expiry_date - today).days
+        if days < 0:
+            return constants.EXPIRED, "Expired"
+        if days == 0:
+            return constants.EXPIRING_SOON, "Expires today"
+        if days <= 15:
+            return constants.EXPIRING_SOON, f"Expires in {days} days"
+
+        return constants.ACTIVE, "Active"
+
+    def save(self, *args, **kwargs):
+        status, label = self.get_document_status()
+        self.doc_status = status
+
+        if self.expiry_date and self.expiry_date < timezone.localdate():
+            self.is_expired = True
+        else:
+            self.is_expired = False
+
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.file_path} - {self.file_name}"
@@ -169,22 +262,62 @@ class Documents(Base):
 
 class OwnerDocuments(Documents):
     owner = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name="owner_documents")
+    code = models.CharField(max_length=50, blank=True)
 
+    def generate_code(self):
+        return f"OD{self.pk:05d}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if not self.code:
+            self.code = self.generate_code()
+            OwnerDocuments.objects.filter(pk=self.pk).update(code=self.code)
+ 
     def __str__(self):
-        return f"{self.owner}"
+        return f"{self.code} - {self.document_type.name if self.document_type else ''}"
 
 
 class TenantDocuments(Documents):
     tenant = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name="tenant_documents")
+    code = models.CharField(max_length=50, blank=True)
+    
+    def generate_code(self):
+        return f"TD{self.pk:05d}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+        if not self.code:
+            self.code = self.generate_code()
+            TenantDocuments.objects.filter(pk=self.pk).update(code=self.code)
 
     def __str__(self):
-        return f"{self.tenant}"
+        return f"{self.code} - {self.document_type.name if self.document_type else ''}" 
 
+class PMCDocuments(Documents):
+    pmc = models.ForeignKey("property.PropertyManagmentCompany", on_delete=models.CASCADE, related_name="pmc_documents")
+    code = models.CharField(max_length=50, blank=True)
+ 
+    def generate_code(self):
+        return f"PD{self.pk:05d}"
+ 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+ 
+        if not self.code:
+            self.code = self.generate_code()
+            PMCDocuments.objects.filter(pk=self.pk).update(code=self.code)
+ 
+    def __str__(self):
+        return (
+            f"{self.code} - "
+            f"{self.pmc.name} - "
+            f"{self.document_type.name if self.document_type else ''}"
+        )
 
 class PrivacyPolicy(Base):
     title = models.CharField(max_length=255)
-    content = models.TextField()
-    other_policy_content = models.TextField()
+    other_policy_content = models.JSONField(default=list, blank=True)
 
     def __str__(self):
         return self.title
@@ -197,3 +330,44 @@ class FAQ(models.Model):
     def __str__(self):
         return self.question
 
+class Approval(Base):
+
+    tenant = models.ForeignKey("user_service.Tenant",on_delete=models.CASCADE,related_name="tenant_rent_requests")
+    unit = models.ForeignKey("property.Unit",on_delete=models.CASCADE,related_name="rent_approvals")
+    requested_rent = models.DecimalField(max_digits=10,decimal_places=2)
+    requested_tenure = models.CharField(max_length=50,null=True,blank=True)
+    approved = models.BooleanField(default=False)
+    approved_by = models.ForeignKey("user_service.UserProfile",on_delete=models.SET_NULL,null=True,blank=True,related_name="approved_rent_requests")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    def __str__(self):
+        return f"{self.unit} - {self.tenant}"
+
+import uuid
+from property.models import PropertyManagmentCompany
+class PMInvitation(Base):
+    STATUS_CHOICES = (
+        ("PENDING", "Pending"),
+        ("ACCEPTED", "Accepted"),
+        ("EMAIL_MISMATCH", "Email Mismatch"),
+        ("EXPIRED", "Expired"),
+        ("CANCELLED", "Cancelled"),
+    )
+
+    pmc = models.ForeignKey(
+        PropertyManagmentCompany,
+        on_delete=models.CASCADE,
+        related_name="pm_invitations"
+    )
+
+    invited_by = models.ForeignKey(
+        UserProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="sent_pm_invitations"
+    )
+    invited_email = models.EmailField()
+    signup_email = models.EmailField(null=True,blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    invited_at = models.DateTimeField(auto_now_add=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    invitation_token = models.UUIDField( default=uuid.uuid4, unique=True, editable=False)

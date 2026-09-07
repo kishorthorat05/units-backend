@@ -1,10 +1,30 @@
-
 import json
 import uuid
 from django.contrib.auth.hashers import make_password
 from utilities import status, constants
 from utilities.helper_functions import prepare_response, validate_password, send_ses_email
 from user_service.models import UserProfile, UserVerification, Owner, Tenant, PropertyManager
+from plugins.logger_plugin import get_logger
+
+logger = get_logger(__name__)
+def _build_permissions(profile):
+    """Return permission map for a PropertyManager, empty dict otherwise."""
+    if not isinstance(profile, PropertyManager):
+        return {}
+    pm = PropertyManager.objects.filter(pk=profile.pk).prefetch_related("roles__permissions").first()
+    if not pm:
+        return {}
+    permissions = {}
+    for role in pm.roles.all():
+        for perm in role.permissions.all():
+            existing = permissions.get(perm.module_name, {"create": False, "edit": False, "delete": False, "view": False})
+            permissions[perm.module_name] = {
+                "create": existing["create"] or perm.create,
+                "edit":   existing["edit"]   or perm.edit,
+                "delete": existing["delete"] or perm.delete,
+                "view":   existing["view"]   or perm.view,
+            }
+    return permissions
 from user_service.utils import request_otp_sent
 from utilities.decorator import is_request_authenticated
 from utilities.jwt_token import create_jwt_token, get_jwt_token
@@ -26,6 +46,8 @@ def send_otp(request):
         purpose = data.get("purpose")  
 
         if not email:
+            logger.warning(
+                    "OTP_SEND_FAILED | reason=EMAIL_MISSING" )
             return prepare_response(
                 message=constants.EMAIL_REQUIRED,
                 status=status.HTTP_400_BAD_REQUEST
@@ -42,16 +64,28 @@ def send_otp(request):
             try:
                 user_obj = UserProfile.objects.get(user__email=email)
             except UserProfile.DoesNotExist:
+                logger.warning(
+                    "OTP_SEND_FAILED | purpose=%s | reason=USER_NOT_FOUND",
+                    purpose_text )
                 return prepare_response(
                     message=constants.USER_DOES_NOT_EXIST,
                     status=status.HTTP_404_NOT_FOUND
                 )
 
         elif purpose_text == "signup":
-            if UserProfile.objects.filter(user__email=email).exists():
+            existing = UserProfile.objects.select_related("user").filter(user__email=email).first()
+            if existing:
                 return prepare_response(
-                    message=constants.EMAIL_ALREADY_REGISTERED,
-                    status=status.HTTP_400_BAD_REQUEST
+                    message="User already registered. Please log in to continue.",
+                    content={
+                        "already_registered": True,
+                        "id":         existing.id,
+                        "email":      existing.user.email,
+                        "first_name": existing.user.first_name,
+                        "last_name":  existing.user.last_name,
+                        "name":       f"{existing.user.first_name} {existing.user.last_name}".strip(),
+                    },
+                    status=status.HTTP_200_OK
                 )
 
         elif purpose_text in ["forget_password", "reset_password"]:
@@ -89,21 +123,28 @@ def send_otp(request):
             {"otp": otp, "purpose": purpose_text, "expiry_minutes": constants.OTP_EXPIRY_MINUTES}
         )
 
-        subject = f"{purpose_text.capitalize()} OTP - DOQFY"
+        subject = f"{purpose_text.capitalize()} OTP - UNITS"
         body_text = f"Your OTP is: {otp}"
         print(f"Generated OTP for {email} is {otp}")  # Debug log
 
         success = send_ses_email(email, subject, body_text, body_html)
 
         if success:
+            logger.info(
+                    "OTP_SENT_SUCCESS | purpose=%s", purpose_text )
             return prepare_response(message=constants.OTP_SENT_SUCCESS)
         else:
+            logger.error(
+                "OTP_SEND_FAILED | purpose=%s", purpose_text )
             return prepare_response(
                 message=constants.OTP_SEND_FAILED,
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
     except Exception as e:
+        logger.exception(
+            "OTP_SEND_ERROR | error=%s",
+            str(e))
         print("SEND OTP ERROR:", e)
         return prepare_response(
             message=f"Unexpected error: {str(e)}",
@@ -125,6 +166,8 @@ def verify_otp(request):
         purpose = (data.get("purpose") or "login").lower()
 
         if not (email and otp):
+            logger.warning(
+                "OTP_VERIFY_FAILED | reason=EMAIL_OR_OTP_MISSING" )
             return prepare_response(
                 message=constants.EMAIL_OTP_REQUIRED,
                 status=status.HTTP_400_BAD_REQUEST
@@ -171,7 +214,9 @@ def verify_otp(request):
         record.is_verified = True
         record.verified_time = timezone.now()
         record.save()
-
+        logger.info(
+            "OTP_VERIFIED_SUCCESS | purpose=%s",
+            purpose )
         return prepare_response(
             message=constants.OTP_VERIFIED_SUCCESS,
             content={"email": email},
@@ -179,6 +224,9 @@ def verify_otp(request):
         )
 
     except Exception as e:
+        logger.exception(
+            "OTP_VERIFY_ERROR | error=%s",str(e)
+)
         print("VERIFY OTP ERROR:", e)
         return prepare_response(
             message=constants.INTERNAL_SERVER_ERROR,
@@ -200,18 +248,24 @@ def reset_password(request):
         confirm_password = data.get("confirm_password")
 
         if not all([email, otp, password, confirm_password]):
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=REQUIRED_FIELDS_MISSING")
             return prepare_response(
                 message=constants.EMAIL_OTP_PASSWORD_REQUIRED,
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         if password != confirm_password:
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=PASSWORD_MISMATCH" )
             return prepare_response(
                 message=constants.PASSWORDS_DO_NOT_MATCH,
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         if not validate_password(password):
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=WEAK_PASSWORD" )
             return prepare_response(
                 message=constants.WEAK_PASSWORD,
                 status=status.HTTP_400_BAD_REQUEST
@@ -223,6 +277,8 @@ def reset_password(request):
         ).order_by('-verified_time').first()
 
         if not verified_record:
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=INVALID_OTP" )
             return prepare_response(
                 message=constants.INCORRECT_OTP,
                 status=status.HTTP_400_BAD_REQUEST
@@ -230,6 +286,8 @@ def reset_password(request):
 
         expiry_time = verified_record.verified_time + timezone.timedelta(minutes=10)
         if timezone.now() > expiry_time:
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=OTP_EXPIRED" )
             return prepare_response(
                 message=constants.OTP_EXPIRED,
                 status=status.HTTP_400_BAD_REQUEST
@@ -237,6 +295,8 @@ def reset_password(request):
 
         user_profile = UserProfile.objects.filter(user__email=email).first()
         if not user_profile:
+            logger.warning(
+                "PASSWORD_RESET_FAILED | reason=USER_NOT_FOUND" )
             return prepare_response(
                 message=constants.USER_NOT_FOUND,
                 status=status.HTTP_400_BAD_REQUEST
@@ -244,13 +304,16 @@ def reset_password(request):
 
         user_profile.user.password = make_password(password)
         user_profile.user.save(update_fields=['password'])
-
+        logger.info(
+            "PASSWORD_RESET_SUCCESS ")
         return prepare_response(
             message=constants.PASSWORD_RESET_SUCCESS,
             status=status.HTTP_200_OK
         )
 
     except Exception as e:
+        logger.exception(
+            "PASSWORD_RESET_ERROR | error=%s", str(e))
         print("RESET PASSWORD ERROR:", e)
         return prepare_response(
             message=constants.INTERNAL_SERVER_ERROR,
@@ -262,11 +325,17 @@ def reset_password(request):
 def logout(request):
     try:
         UserProfile.objects.filter(pk=request.user.pk).update(token=None)
+        logger.info(
+            "USER_LOGOUT_SUCCESS | user_id=%s",
+            request.user.id )
         return prepare_response(
             message=constants.LOGOUT_SUCCESSFULL,
             status=status.HTTP_200_OK
         )
     except Exception as e:
+        logger.exception(
+            "USER_LOGOUT_ERROR | user_id=%s | error=%s",
+            request.user.id, str(e) )
         print("LOGOUT ERROR:", e)
         return prepare_response(
             message=constants.INTERNAL_SERVER_ERROR,
@@ -304,6 +373,9 @@ def change_password(request):
             )
 
         if not validate_password(new_password):
+            logger.warning(
+                "PASSWORD_CHANGE_FAILED | user_id=%s | reason=WEAK_PASSWORD",
+                request.user.id )
             return prepare_response(
                 message=constants.WEAK_PASSWORD,
                 status=status.HTTP_400_BAD_REQUEST
@@ -322,13 +394,18 @@ def change_password(request):
       
         user.set_password(new_password)
         user.save(update_fields=["password"])
-
+        logger.info(
+            "PASSWORD_CHANGE_SUCCESS | user_id=%s",
+            request.user.id )
         return prepare_response(
             message=constants.PASSWORD_UPDATED,
             status=status.HTTP_200_OK
         )
 
     except Exception as e:
+        logger.exception(
+            "PASSWORD_CHANGE_ERROR | user_id=%s | error=%s",
+            request.user.id, str(e) )
         print("CHANGE PASSWORD ERROR:", e)
         return prepare_response(
             message=constants.INTERNAL_SERVER_ERROR,
@@ -365,6 +442,8 @@ def user_login(request):
     if email and password:
         profile = profile_model.objects.select_related("user").filter(user__email=email).first()
         if not profile:
+            logger.warning(
+                "LOGIN_FAILED | reason=USER_NOT_ONBOARDED" )
             return prepare_response(
                 message=constants.USER_NOT_ONBOARDED,
                 status=status.HTTP_400_BAD_REQUEST
@@ -392,7 +471,9 @@ def user_login(request):
 
         user.last_login = timezone.now()
         user.save(update_fields=["last_login"])
-
+        logger.info(
+            "LOGIN_SUCCESS | user_id=%s | role=%s",
+            profile.id,user_role )
         return prepare_response(
             content={
                 "id": profile.id,
@@ -404,6 +485,7 @@ def user_login(request):
                 "last_name": user.last_name,
                 "profile_image": profile.profile_image,
                 "company_name": company_name,
+                "permissions": _build_permissions(profile),
             },
             message=constants.LOGIN_SUCCESSFUL,
             status=status.HTTP_200_OK
@@ -466,6 +548,7 @@ def user_login(request):
                 "last_name": user.last_name,
                 "profile_image": profile.profile_image,
                 "company_name": company_name,
+                "permissions": _build_permissions(profile),
             },
             message=constants.LOGIN_SUCCESSFUL_WITH_OTP,
             status=status.HTTP_200_OK

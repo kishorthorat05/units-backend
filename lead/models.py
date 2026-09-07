@@ -2,38 +2,28 @@ from django.db import models
 from user_service.models import UserProfile
 from property_management.models import Base
 from utilities import constants
+from utilities.org_scope import get_pmc_ids_for_user
 
-# Create your models here.
+
+class LeadQuerySet(models.QuerySet):
+    def for_user(self, user_profile):
+        pmc_ids = get_pmc_ids_for_user(user_profile)
+        if not pmc_ids:
+            return self.none()
+        return self.filter(pmc_id__in=pmc_ids)
+
+
 class Lead(Base):
+    objects = LeadQuerySet.as_manager()
     code = models.CharField(max_length=255, blank=True)
-    unit = models.ForeignKey(
-        "property.Unit",
-        on_delete=models.CASCADE,
-        related_name="leads"
-    )
-    tenant = models.ForeignKey(
-        UserProfile,
-        on_delete=models.SET_NULL,
-        related_name="tenant_leads",
-        null=True,
-        blank=True
-    )
+    unit = models.ForeignKey("property.Unit",on_delete=models.CASCADE,related_name="leads")
+    tenant = models.ForeignKey(UserProfile,on_delete=models.SET_NULL,related_name="tenant_leads",null=True,blank=True)
     name = models.CharField(max_length=255)
     email = models.EmailField()
     contact_number = models.CharField(max_length=20)
-    status = models.CharField(
-        max_length=20,
-        choices=constants.LEAD_STATUS_CHOICES,
-        default=constants.INTERESTED
-    )
-    platform = models.CharField(
-        max_length=20,
-        choices=constants.PLATFORM_CHOICES
-    )
-    lead_type = models.CharField(
-        max_length=20,
-        choices=constants.LEAD_TYPE_CHOICES
-    )
+    status = models.CharField(max_length=20,choices=constants.LEAD_STATUS_CHOICES,default=constants.INTERESTED)
+    platform = models.CharField(max_length=20,choices=constants.PLATFORM_CHOICES)
+    lead_type = models.CharField(max_length=20,choices=constants.LEAD_TYPE_CHOICES)
     referred_by = models.ForeignKey(
         UserProfile,
         on_delete=models.SET_NULL,
@@ -66,3 +56,30 @@ class ActivityLog(Base):
     title = models.CharField(max_length=255, blank=True)
     description = models.TextField(blank=True)
     scheduled_date = models.DateTimeField(null=True, blank=True)
+
+class ScheduleMeeting(Base):
+    STATUS_CHOICES = (
+        ("SCHEDULED", "Scheduled"),
+        ("COMPLETED", "Completed"),
+        ("CANCELLED", "Cancelled"),
+    )
+
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.CASCADE,
+        related_name="meetings"
+    )
+
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="SCHEDULED"
+    )
+    google_calendar_url = models.URLField(max_length=1000, blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.title} - {self.lead}"

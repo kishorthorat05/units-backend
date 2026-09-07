@@ -1,7 +1,7 @@
 migrations
 db.sqlite3
 *.pyc
-environment_settings.py
+local_settings.py
 requirements.txt
 .vscode/
 media
@@ -9,3 +9,8 @@ static
 .env
 .venv
 venv/
+test_weasy.py
+
+.django_cache
+.github
+.DS_Store

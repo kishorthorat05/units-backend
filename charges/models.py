@@ -3,7 +3,7 @@ from django.forms.models import model_to_dict
 from property_management.models import Base, Country
 
 
-class Charge(Base): 
+class Charge(Base):
 
     description = models.CharField(max_length=255)
 
@@ -41,5 +41,4 @@ class Charge(Base):
 
         data["country"] = self.country._get_country_info()
 
-        return data 
-        
+        return data

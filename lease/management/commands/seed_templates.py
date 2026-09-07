@@ -6,6 +6,7 @@ from lease.models import Template, TemplateField
 from utilities import constants
 
 TEMPLATE_PATH = os.path.join(settings.MEDIA_ROOT, "pre_defined_templates", "lease_agreement.html")
+RENTAL_AGREEMENT_PATH = os.path.join(settings.MEDIA_ROOT, "pre_defined_templates", "rental_agreement.html")
 
 
 # ── Template definitions ──────────────────────────────────────────────────────
@@ -300,8 +301,8 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "--user",
-            default="nikhil@doqfy.in",
-            help="Email of the user to set as created_by (default: nikhil@doqfy.in)",
+            default="nikhil@getunits.ai",
+            help="Email of the user to set as created_by (default: nikhil@getunits.ai)",
         )
 
     def handle(self, *args, **options):

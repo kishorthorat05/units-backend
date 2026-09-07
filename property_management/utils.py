@@ -8,9 +8,10 @@ from property.models import (
     PropertyManagmentCompany,
     PropertyImages
 )
-from property_management.models import UserInvitation, AuditLog
+from property_management.models import UserInvitation, AuditLog, DashboardVisualization
 from utilities.helper_functions import send_ses_email, fetch_s3_presigned_url, datetime_to_epoch_millis
 from utilities import status ,  constants
+from utilities.config import FRONTEND_URL
 from django.contrib.auth.models import User
 import uuid
 import re
@@ -299,9 +300,9 @@ def create_and_send_invitation(invited_by_profile, email, invitation_type, templ
     )
     user_exists = User.objects.filter(email=email).exists()
     if user_exists:
-        base_url = "https://units.doqfy.in/auth/login"
+        base_url = f"{FRONTEND_URL}/auth/login"
     else:
-        base_url = "https://units.doqfy.in/auth/new-user"
+        base_url = f"{FRONTEND_URL}/auth/new-user"
     invite_link = base_url 
     subject = "Invitation to Join Property Management Portal"
     property_context = {}
@@ -375,7 +376,7 @@ def serialize_lease(lease):
         "lease_grace_start_date": datetime_to_epoch_millis(lease.lease_grace_start_date),
         "lease_grace_end_date": datetime_to_epoch_millis(lease.lease_grace_end_date),
         "lease_remarks": lease.lease_remarks,
-        "step_status": lease.step_status,
+        "step_status": lease.lease_stage,
         "lease_status": lease.lease_status,
         "pdf_path": lease.pdf_path,
 
@@ -415,14 +416,15 @@ def get_property_images(property_id, single=False):
         return {
             "error": False,
             "property": property_obj,
-            "images": []  
+            "images": []
         }
 
     final_images = []
 
- 
     if single:
-        images_qs = images_qs[:1]  
+        # Prefer EXTERIOR image as thumbnail; fall back to first available
+        thumbnail = images_qs.filter(image_type="EXTERIOR").first() or images_qs.first()
+        images_qs = PropertyImages.objects.filter(pk=thumbnail.pk)
 
     for img in images_qs:
         final_images.append({
@@ -552,3 +554,10 @@ def audit_logs(request, message, action_type):
         message=message,
         action_type=action_type
     )
+
+def is_dashboard_enabled(user, key):
+    return DashboardVisualization.objects.filter(
+        user=user,
+        visualization=key,
+        is_visible=True
+    ).exists()

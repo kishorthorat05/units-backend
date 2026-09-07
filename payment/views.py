@@ -1,25 +1,32 @@
-from lease.models import Lease
-from payment.models import Payment,ChargeDetails
-from utilities.helper_functions import prepare_response ,datetime_to_epoch_millis
+from lease.models import Lease, LeaseTransaction
+from utilities.helper_functions import prepare_response, datetime_to_epoch_millis
 from utilities import status, constants
 from utilities.decorator import is_request_authenticated
-from django.db.models import Sum
-from django.db.models import Prefetch
+from django.core.paginator import Paginator
+from rest_framework.decorators import api_view
+
+from .swagger import (
+    access_rental_account_get,
+    owner_rent_amounts_get,
+    rental_payments_get,
+)
 
 #=====================================
 #PAYMENT METHOD VIEWS
-#=====================================       
+#=====================================
+@access_rental_account_get
+@api_view(["GET"])
 @is_request_authenticated
 def access_rental_account(request):
     if request.method == "GET":
         req_data = request.GET
         lease_id = req_data.get("lease_id")
-        
+
         kwargs = {}
-        
+
         if lease_id:
             kwargs["id"] = lease_id
-        
+
         leases = Lease.objects.filter(**kwargs)
 
         lease_details = [
@@ -31,14 +38,16 @@ def access_rental_account(request):
             message=constants.DATA_FETCHED_SUCCESSFULLY,
             status=status.HTTP_200_OK
         )
-    
+
     else:
         return prepare_response(
             message=constants.INVALID_REQUEST_METHOD,
             status=status.HTTP_400_BAD_REQUEST
         )
-    
 
+
+@owner_rent_amounts_get
+@api_view(["GET"])
 @is_request_authenticated
 def owner_rent_amounts(request):
     if request.method != "GET":
@@ -48,78 +57,48 @@ def owner_rent_amounts(request):
         )
 
     try:
-        user = request.user  # UserProfile
+        user = request.user
 
-        # 🔹 Payments related to OWNER via property_unit → owner
-        payments = Payment.objects.select_related(
-            "rental_account",
-            "rental_account__tenant",
-            "rental_account__lease_property",
-            "rental_account__lease_property__property",
+        page  = int(request.GET.get("page", 1))
+        limit = int(request.GET.get("limit", 10))
+
+        leases = Lease.objects.select_related(
+            "unit__property_block_tower__property",
+            "tenant__user",
         ).filter(
-            rental_account__lease_property__owner=user
-        )
+            unit__unit_owners__owner_id=user.id
+        ).distinct().order_by("-id")
+
+        paginator = Paginator(leases, limit)
+        page_obj  = paginator.get_page(page)
 
         response = []
-
-        for payment in payments:
-            lease = payment.rental_account
-            tenant = lease.tenant
-            unit = lease.lease_property
-            property_obj = unit.property if unit else None
-
-            # 🔹 Charges (VAT, other charges)
-            charges = ChargeDetails.objects.filter(
-                lease=lease,
-                is_selected=True
-            )
-
-            # vat_amount = charges.aggregate(
-            #     vat=Sum("vat_amount")
-            # )["vat"] or 0
-
-            # other_charges = charges.aggregate(
-            #     amt=Sum("amount")
-            # )["amt"] or 0
-
-            # total_rent = (lease.annual_amount or 0) + other_charges + vat_amount
+        for lease in page_obj:
+            unit     = lease.unit
+            pb       = unit.property_block_tower if unit else None
+            prop     = pb.property if pb else None
+            tenant   = lease.tenant
 
             response.append({
-                # 🔹 Tenant
-                "tenant_name": tenant.user.get_full_name() if tenant else None,
-                "tenant_no": tenant.user_code if tenant else None,
-
-                # 🔹 Property info
-                "property_name": property_obj.property_name if property_obj else None,
-                "room_no": unit.apartment_no if unit else None,
-                "unit_type": unit.property_type if unit else None,
-
-                # 🔹 Lease info
-                "lease_no": lease.lease_number,
+                "tenant_name": tenant.user.get_full_name() if tenant and tenant.user else None,
+                "tenant_no":   getattr(tenant, "user_code", None) if tenant else None,
+                "property_name": prop.property_name if prop else None,
+                "room_no":       unit.unit_name or unit.code if unit else None,
+                "unit_type":     getattr(unit, "property_type", None) if unit else None,
+                "lease_no":     lease.code,
                 "lease_status": lease.lease_status,
-                "period_from": datetime_to_epoch_millis(lease.lease_start_date),
-                "period_to":datetime_to_epoch_millis(lease.lease_end_date),
-
-                # 🔹 Rent details
-                "year_rent": lease.annual_amount,
-                "vat":None,
-
-                "other_charges":None,
-                # "vat": float(vat_amount),
-                "total_rent": None,
-
-                    #    "lease_start_date": datetime_to_epoch_millis(lease.lease_start_date),
-        # "lease_end_date": datetime_to_epoch_millis(lease.lease_end_date),
-
-                # 🔹 Payment info
-                "payment_amount": payment.amount,
-                "payment_method": payment.method,
-                "payment_status": payment.status,
-                "payment_reason": payment.reason_type,
+                "period_from":  datetime_to_epoch_millis(lease.start_date),
+                "period_to":    datetime_to_epoch_millis(lease.end_date),
+                "year_rent":     lease.annual_amount,
+                "vat":           None,
+                "other_charges": None,
+                "total_rent":    None,
             })
 
         return prepare_response(
             content=response,
+            paginator=page_obj,
+            total_records=paginator.count,
             message="Rent amounts fetched successfully",
             status=status.HTTP_200_OK
         )
@@ -131,49 +110,42 @@ def owner_rent_amounts(request):
         )
 
 
-
-
+@rental_payments_get
+@api_view(["GET"])
 @is_request_authenticated
 def rental_payments(request):
-    user_profile = request.user         
-    auth_user = request.user.user     
- 
+    user_profile = request.user
+    auth_user = request.user.user
+
     if request.method == "GET":
         lease_id = request.GET.get("lease_id")
 
-        filters = {
-            "created_by": auth_user
-        }
+        filters = {"created_by": auth_user}
 
         if lease_id:
-            filters["rental_account_id"] = lease_id
+            filters["lease_id"] = lease_id
 
-        payments = Payment.objects.filter(**filters).select_related(
-            "bank", "rental_account"
+        transactions = LeaseTransaction.objects.filter(**filters).select_related(
+            "origin_bank", "lease"
         )
 
         data = []
-        for payment in payments:
+        for t in transactions:
             data.append({
-                "id": payment.id,
-                "bank": payment.bank.name if payment.bank else None,
-                "bank_account": payment.account_number,
-                "cheque_number": payment.cheque_number,
-                "cheque_date": datetime_to_epoch_millis(payment.cheque_date),
-                "payment_type": {
-                    "key": payment.method,
-                    "value": payment.get_method_display()
-                },
-                "purpose": payment.reason_type,
-           
-                "amount": payment.amount,
-                 "status":  payment.status,
-               
-                "created": datetime_to_epoch_millis(payment.created),
+                "id": t.id,
+                "origin_bank": t.origin_bank.name if t.origin_bank else None,
+                "origin_account_number": t.origin_account_number,
+                "cheque_number": t.cheque_number,
+                "cheque_date": datetime_to_epoch_millis(t.cheque_date),
+                "payment_type": t.payment_type,
+                "cheque_type": t.cheque_type,
+                "amount": t.amount,
+                "status": t.status,
+                "created": datetime_to_epoch_millis(t.created),
                 "lease": {
-                    "id": payment.rental_account.id,
-                    "lease_number": payment.rental_account.lease_number
-                }
+                    "id": t.lease.id,
+                    "lease_number": t.lease.code
+                } if t.lease else None
             })
 
         return prepare_response(
@@ -183,10 +155,6 @@ def rental_payments(request):
         )
     else:
         return prepare_response(
-          
-            message=constants.INVALID_METHOD,
-            status=status.HTTP_200_OK
+            message=constants.INVALID_REQUEST_METHOD,
+            status=status.HTTP_400_BAD_REQUEST
         )
-
-
-

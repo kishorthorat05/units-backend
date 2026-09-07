@@ -1,6 +1,6 @@
 import json
 from terms.models import TermsAndConditions, TermCategory
-from user_service.models import Country
+from property_management.models import Country
 from utilities.decorator import is_request_authenticated
 from utilities.helper_functions import prepare_response
 from utilities import constants, status  
@@ -112,7 +112,8 @@ def terms_api(request):
             title=title,
             description=description,
             country=country_obj,
-            category=category_obj
+            category=category_obj,
+            created_by=request.user.user,
         )
 
         return prepare_response(
